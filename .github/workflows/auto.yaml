@@ -202,49 +202,6 @@ jobs:
           git commit -m "Auto-update: VERSIONS" || exit 0
           git push
 
-      - name: Publish legacy archive to Telegram
-        if: steps.check_versions.outputs.build_needed == 'true'
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
-          IMAGE_REPO: medium1992/remnanode-ros
-        run: |
-          set -euo pipefail
-
-          if [ -z "${TELEGRAM_BOT_TOKEN}" ] || [ -z "${TELEGRAM_CHAT_ID}" ]; then
-            echo "Telegram secrets are not configured, skipping Telegram publish."
-            exit 0
-          fi
-
-          version="node-${{ env.remnanode }}-xray-${{ env.xray }}"
-          image="${IMAGE_REPO}:${version}"
-          archives=()
-          for arch in amd64 arm64; do
-            archive="remnanode-ros-${arch}-${version}.tar.gz"
-            docker pull --platform "linux/${arch}" "$image"
-            docker save "$image" | gzip -9 > "$archive"
-            sha256sum "$archive" > "${archive}.sha256"
-            archives+=("$archive" "${archive}.sha256")
-          done
-
-          thread_args=()
-          if [ -n "${TELEGRAM_THREAD_ID}" ]; then
-            thread_args=(-F "message_thread_id=${TELEGRAM_THREAD_ID}")
-          fi
-
-          telegram_failed=false
-          for archive in "${archives[@]}"; do
-            curl -fsSL -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-              -F "chat_id=${TELEGRAM_CHAT_ID}" \
-              "${thread_args[@]}" \
-              -F "document=@${archive}" \
-              -F "caption=${archive}" || telegram_failed=true
-          done
-          if [ "$telegram_failed" = true ]; then
-            echo "::warning::Telegram rejected one or more image archives; images were published to registries."
-          fi
-
       - name: Log in to GHCR with crane
         if: steps.check_versions.outputs.build_needed == 'true'
         run: echo "${GITHUB_TOKEN}" | crane auth login ghcr.io -u ${PACKAGE_OWNER} --password-stdin
