@@ -1,0 +1,23 @@
+# Package builder used by remnanode-ros only. The final Node image is still
+# built with the Dockerfile cloned from the matching upstream Node release.
+FROM node:24-trixie-slim
+
+ARG NFTABLES_NAPI_REF
+ARG TARGETARCH
+
+RUN test -n "${NFTABLES_NAPI_REF}"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates git pkg-config python3 libmnl-dev libnftnl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/nftables-napi
+
+RUN git clone https://github.com/Medium1992/nftables-napi-fork.git . \
+    && git checkout "${NFTABLES_NAPI_REF}" \
+    && npm ci --no-audit --no-fund \
+    && npm run build \
+    && case "${TARGETARCH}" in amd64) PREBUILD_ARCH=x64 ;; arm64) PREBUILD_ARCH=arm64 ;; *) exit 1 ;; esac \
+    && mkdir -p "/out/prebuilds/linux-${PREBUILD_ARCH}" \
+    && cp build/Release/nftables_napi.node "/out/prebuilds/linux-${PREBUILD_ARCH}/nftables-napi.glibc.node"

@@ -1,0 +1,337 @@
+name: Build and Publish
+
+on:
+  schedule:
+    - cron: "0 20 * * *" # 20:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: remnanode-ros-publish
+  cancel-in-progress: false
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PACKAGE_OWNER: medium1992
+      PACKAGE_NAME: remnanode-ros
+      PACKAGE_NAME_ENCODED: remnanode-ros
+      DELETE_UNTAGGED: "true"
+
+    steps:
+      - name: Install jq and crane
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          curl -sL https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz | sudo tar -C /usr/local/bin -xz crane
+          chmod +x /usr/local/bin/crane
+          crane version || { echo "Crane failed to install"; exit 1; }
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Get latest versions
+        run: |
+          set -euo pipefail
+
+          REMNANODE=$(curl -fsSL https://api.github.com/repos/remnawave/node/releases/latest | jq -r '.tag_name')
+          UPSTREAM_DOCKERFILE=$(curl -fsSL "https://raw.githubusercontent.com/remnawave/node/${REMNANODE}/Dockerfile")
+          XRAY=$(printf '%s\n' "$UPSTREAM_DOCKERFILE" | sed -n 's/^ARG XRAY_CORE_VERSION=//p')
+          NFTABLES_NAPI=$(git ls-remote https://github.com/Medium1992/nftables-napi-fork.git refs/heads/routeros-native-netlink | cut -f1)
+
+          for variable in REMNANODE XRAY NFTABLES_NAPI; do
+            test -n "${!variable}" && test "${!variable}" != "null" || { echo "$variable is empty"; exit 1; }
+          done
+
+          echo "remnanode=$REMNANODE" >> "$GITHUB_ENV"
+          echo "xray=$XRAY" >> "$GITHUB_ENV"
+          echo "nftables_napi=$NFTABLES_NAPI" >> "$GITHUB_ENV"
+
+      - name: Compare with VERSIONS
+        id: check_versions
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run -> force build"
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NEED_BUILD=false
+          while IFS='=' read -r name version; do
+            latest=${!name}
+            if [ "$latest" != "$version" ]; then
+              NEED_BUILD=true
+              break
+            fi
+          done < VERSIONS
+          echo "build_needed=$NEED_BUILD" >> "$GITHUB_OUTPUT"
+
+      - name: Update VERSIONS
+        if: steps.check_versions.outputs.build_needed == 'true'
+        run: |
+          cat > VERSIONS <<EOF
+          remnanode=${{ env.remnanode }}
+          EOF
+
+      - name: Set up QEMU
+        if: steps.check_versions.outputs.build_needed == 'true'
+        uses: docker/setup-qemu-action@v4
+        with:
+          cache-image: false
+
+      - name: Set up Docker Buildx
+        if: steps.check_versions.outputs.build_needed == 'true'
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+          driver-opts: |
+            image=moby/buildkit:master
+            network=host
+
+      - name: Restore nftables-napi package cache
+        if: steps.check_versions.outputs.build_needed == 'true'
+        id: napi-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: nftables-napi-cache/nftables-napi-routeros.tgz
+          key: nftables-napi-routeros-${{ env.nftables_napi }}
+
+      - name: Prepare upstream Node build context
+        if: steps.check_versions.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 --branch "${{ env.remnanode }}" https://github.com/remnawave/node.git upstream
+
+          mkdir -p nftables-napi-cache
+          if [ "${{ steps.napi-cache.outputs.cache-hit }}" != "true" ]; then
+            docker buildx build \
+              --platform linux/amd64 \
+              --build-arg NFTABLES_NAPI_REF="${{ env.nftables_napi }}" \
+              --output type=local,dest=nftables-napi-amd64 \
+              -f Dockerfile.nftables-napi \
+              .
+            docker buildx build \
+              --platform linux/arm64 \
+              --build-arg NFTABLES_NAPI_REF="${{ env.nftables_napi }}" \
+              --output type=local,dest=nftables-napi-arm64 \
+              -f Dockerfile.nftables-napi \
+              .
+
+            git clone https://github.com/Medium1992/nftables-napi-fork.git nftables-napi-package
+            pushd nftables-napi-package
+            git checkout "${{ env.nftables_napi }}"
+            mkdir -p prebuilds/linux-x64 prebuilds/linux-arm64
+            cp ../nftables-napi-amd64/prebuilds/linux-x64/nftables-napi.glibc.node prebuilds/linux-x64/
+            cp ../nftables-napi-arm64/prebuilds/linux-arm64/nftables-napi.glibc.node prebuilds/linux-arm64/
+            npm pack --pack-destination ../nftables-napi-cache
+            popd
+            mv nftables-napi-cache/nftables-napi-*.tgz nftables-napi-cache/nftables-napi-routeros.tgz
+          fi
+
+          mkdir -p upstream/vendor
+          cp nftables-napi-cache/nftables-napi-routeros.tgz upstream/vendor/
+
+          pushd upstream
+          npm pkg set 'dependencies.nftables-napi=file:vendor/nftables-napi-routeros.tgz'
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Dockerfile")
+          text = path.read_text()
+          needle = "COPY package*.json ./\n"
+          if text.count(needle) != 1:
+              raise SystemExit("Expected exactly one package.json COPY instruction in upstream Dockerfile")
+          path.write_text(text.replace(needle, needle + "COPY vendor/ ./vendor/\n"))
+          PY
+          popd
+
+      - name: Save nftables-napi package cache
+        if: steps.check_versions.outputs.build_needed == 'true' && steps.napi-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: nftables-napi-cache/nftables-napi-routeros.tgz
+          key: ${{ steps.napi-cache.outputs.cache-primary-key }}
+
+      - name: Login to GitHub Container Registry
+        if: steps.check_versions.outputs.build_needed == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: steps.check_versions.outputs.build_needed == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push multi-arch image
+        if: steps.check_versions.outputs.build_needed == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ./upstream
+          file: ./upstream/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/medium1992/remnanode-ros:node-${{ env.remnanode }}-xray-${{ env.xray }}
+            ghcr.io/medium1992/remnanode-ros:latest
+            medium1992/remnanode-ros:node-${{ env.remnanode }}-xray-${{ env.xray }}
+            medium1992/remnanode-ros:latest
+
+      - name: Publish legacy archive to Telegram
+        if: steps.check_versions.outputs.build_needed == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+          IMAGE_REPO: medium1992/remnanode-ros
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TELEGRAM_BOT_TOKEN}" ] || [ -z "${TELEGRAM_CHAT_ID}" ]; then
+            echo "Telegram secrets are not configured, skipping Telegram publish."
+            exit 0
+          fi
+
+          version="node-${{ env.remnanode }}-xray-${{ env.xray }}"
+          image="${IMAGE_REPO}:${version}"
+          archives=()
+          for arch in amd64 arm64; do
+            archive="remnanode-ros-${arch}-${version}.tar.gz"
+            docker pull --platform "linux/${arch}" "$image"
+            docker save "$image" | gzip -9 > "$archive"
+            sha256sum "$archive" > "${archive}.sha256"
+            archives+=("$archive" "${archive}.sha256")
+          done
+
+          thread_args=()
+          if [ -n "${TELEGRAM_THREAD_ID}" ]; then
+            thread_args=(-F "message_thread_id=${TELEGRAM_THREAD_ID}")
+          fi
+
+          for archive in "${archives[@]}"; do
+            curl -fsSL -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+              -F "chat_id=${TELEGRAM_CHAT_ID}" \
+              "${thread_args[@]}" \
+              -F "document=@${archive}" \
+              -F "caption=${archive}"
+          done
+
+      - name: Commit and push VERSIONS
+        if: steps.check_versions.outputs.build_needed == 'true'
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add VERSIONS
+          git commit -m "Auto-update: VERSIONS" || exit 0
+          git push
+
+      - name: Log in to GHCR with crane
+        if: steps.check_versions.outputs.build_needed == 'true'
+        run: echo "${GITHUB_TOKEN}" | crane auth login ghcr.io -u ${PACKAGE_OWNER} --password-stdin
+
+      - name: Analyze GHCR packages (dry-run)
+        if: steps.check_versions.outputs.build_needed == 'true'
+        id: analyze
+        run: |
+          set -e
+
+          echo "Fetching package versions for ${PACKAGE_OWNER}/${PACKAGE_NAME}..."
+          page=1
+          packages_json="[]"
+          last_first_id=""
+          while true; do
+            chunk=$(timeout 30s gh api -H "Accept: application/vnd.github+json" \
+              "/users/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME_ENCODED}/versions?per_page=100&page=$page" || echo "TIMEOUT")
+            if [[ "$chunk" == "TIMEOUT" ]]; then
+              echo "gh api timed out on page $page"
+              exit 1
+            fi
+            chunk_count=$(echo "$chunk" | jq length)
+            if [[ "$chunk_count" -eq 0 ]]; then
+              break
+            fi
+            first_id=$(echo "$chunk" | jq -r '.[0].id // ""')
+            if [[ -n "$last_first_id" && "$first_id" == "$last_first_id" ]]; then
+              echo "Page $page repeated its first package ID; stopping."
+              break
+            fi
+            last_first_id="$first_id"
+            if [[ "$packages_json" == "[]" ]]; then
+              packages_json="$chunk"
+            else
+              packages_json=$(jq -s '.[0] + .[1]' <(echo "$packages_json") <(echo "$chunk"))
+            fi
+            ((page++))
+            if [[ $page -gt 10 ]]; then
+              echo "Reached the ten-page safety limit."
+              break
+            fi
+          done
+
+          declare -A protected_digests
+          declare -A manifest_seen
+
+          # Keep every tagged manifest and every child manifest referenced by a
+          # multi-architecture index. Only independent untagged versions may go.
+          while IFS=$'\t' read -r id digest tags; do
+            [[ -z "$id" ]] && continue
+            protected_digests[$digest]=1
+            if [[ -z "${manifest_seen[$digest]}" ]]; then
+              manifest_seen[$digest]=1
+              manifest_json=$(timeout 10s crane manifest "ghcr.io/${PACKAGE_OWNER}/${PACKAGE_NAME}@${digest}" 2>/dev/null || echo "{}")
+              while IFS= read -r child_digest; do
+                [[ -n "$child_digest" ]] && protected_digests[$child_digest]=1
+              done < <(echo "$manifest_json" | jq -r '(.manifests // [])[].digest // empty')
+            fi
+          done < <(echo "$packages_json" | jq -r '
+            .[] | select((.metadata.container.tags // []) | length > 0) |
+            [ .id, .name, ((.metadata.container.tags // []) | join(", ")) ] | @tsv')
+
+          safe_untagged_ids=()
+          while IFS=$'\t' read -r id digest; do
+            [[ -z "$id" ]] && continue
+            if [[ -z "${protected_digests[$digest]}" ]]; then
+              safe_untagged_ids+=("$id")
+            fi
+          done < <(echo "$packages_json" | jq -r '
+            .[] | select((.metadata.container.tags // []) | length == 0) |
+            [ .id, .name ] | @tsv')
+
+          validated_ids=()
+          for id in "${safe_untagged_ids[@]}"; do
+            if gh api -H "Accept: application/vnd.github+json" \
+              "/users/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME_ENCODED}/versions/$id" >/dev/null 2>&1; then
+              validated_ids+=("$id")
+            fi
+          done
+
+          if [ ${#validated_ids[@]} -eq 0 ]; then
+            echo "safe_untagged_ids_comma=" >> "$GITHUB_OUTPUT"
+          else
+            echo "safe_untagged_ids_comma=$(IFS=,; echo "${validated_ids[*]}")" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cleanup untagged GHCR versions
+        if: env.DELETE_UNTAGGED == 'true' && steps.analyze.outputs.safe_untagged_ids_comma != ''
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: '${{ env.PACKAGE_NAME }}'
+          package-type: 'container'
+          package-version-ids: '${{ steps.analyze.outputs.safe_untagged_ids_comma }}'
+          token: ${{ env.GITHUB_TOKEN }}
