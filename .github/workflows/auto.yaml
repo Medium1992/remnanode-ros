@@ -45,17 +45,23 @@ jobs:
           set -euo pipefail
 
           REMNANODE=$(curl -fsSL https://api.github.com/repos/remnawave/node/releases/latest | jq -r '.tag_name')
-          UPSTREAM_DOCKERFILE=$(curl -fsSL "https://raw.githubusercontent.com/remnawave/node/${REMNANODE}/Dockerfile")
+          if UPSTREAM_DOCKERFILE=$(curl -fsSL "https://raw.githubusercontent.com/remnawave/node/${REMNANODE}/docker/Dockerfile"); then
+            UPSTREAM_DOCKERFILE_PATH=docker/Dockerfile
+          else
+            UPSTREAM_DOCKERFILE=$(curl -fsSL "https://raw.githubusercontent.com/remnawave/node/${REMNANODE}/Dockerfile")
+            UPSTREAM_DOCKERFILE_PATH=Dockerfile
+          fi
           XRAY=$(printf '%s\n' "$UPSTREAM_DOCKERFILE" | sed -n 's/^ARG XRAY_CORE_VERSION=//p')
           NFTABLES_NAPI=$(git ls-remote https://github.com/Medium1992/nftables-napi-fork.git refs/heads/routeros-native-netlink | cut -f1)
 
-          for variable in REMNANODE XRAY NFTABLES_NAPI; do
+          for variable in REMNANODE XRAY NFTABLES_NAPI UPSTREAM_DOCKERFILE_PATH; do
             test -n "${!variable}" && test "${!variable}" != "null" || { echo "$variable is empty"; exit 1; }
           done
 
           echo "remnanode=$REMNANODE" >> "$GITHUB_ENV"
           echo "xray=$XRAY" >> "$GITHUB_ENV"
           echo "nftables_napi=$NFTABLES_NAPI" >> "$GITHUB_ENV"
+          echo "upstream_dockerfile=$UPSTREAM_DOCKERFILE_PATH" >> "$GITHUB_ENV"
 
       - name: Compare with VERSIONS
         id: check_versions
@@ -148,11 +154,11 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("Dockerfile")
+          path = Path("${{ env.upstream_dockerfile }}")
           text = path.read_text()
           needle = "COPY package*.json ./\n"
           if text.count(needle) != 1:
-              raise SystemExit("Expected exactly one package.json COPY instruction in upstream Dockerfile")
+              raise SystemExit(f"Expected exactly one package.json COPY instruction in {path}")
           path.write_text(text.replace(needle, needle + "COPY vendor/ ./vendor/\n"))
           PY
           popd
@@ -184,7 +190,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: ./upstream
-          file: ./upstream/Dockerfile
+          file: ./upstream/${{ env.upstream_dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
