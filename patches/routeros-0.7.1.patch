@@ -1,0 +1,553 @@
+diff --git a/README.md b/README.md
+index 630d063..85428b2 100644
+--- a/README.md
++++ b/README.md
+@@ -2,7 +2,13 @@
+ 
+ Native Node.js binding for nftables via libnftnl + libmnl. Manages IPv4/IPv6 firewall tables with dynamic IP sets, port blocking, named counters, and timeout support through direct netlink communication — no shell commands, no `nft` CLI.
+ 
+-Requires Node.js ≥ 24 and a Linux kernel ≥ 5.7 with `CAP_NET_ADMIN` or root.
++Requires Node.js ≥ 24 and Linux with `CAP_NET_ADMIN` or root.
++
++A kernel ≥ 5.7 is recommended. On older kernels `createTable()` transparently
++retries without the features they lack — per-element counters first, then
++`NFT_SET_CONCAT`, then counters altogether — giving up as little as possible at
++each step. Blocking and timeouts work regardless, and a kernel that only lacks
++`NFT_SET_EXPR` keeps its named per-set counters.
+ 
+ ## Install
+ 
+@@ -96,6 +102,7 @@ await nft.deleteTable();
+ | `egressPortSets` | `string[]` | No | Output port set names. Block by **destination port** (TCP/UDP) on output chain using concatenated `inet_proto . inet_service` sets. Ports are added to both IPv4 and IPv6 tables. IPv6 sets auto-append `'6'`. |
+ | `logging` | `boolean` | No | Log ingress drops. Default `true`. Set to `false` to build the tables without any log expression — see [Disabling logging](#disabling-logging). |
+ | `acceptReplyTraffic` | `boolean` | No | Accept reply traffic before the ingress sets are consulted. Default `true`. See [Reply traffic and conntrack](#reply-traffic-and-conntrack). |
++| `counters` | `boolean` | No | Emit traffic counters. Default `true`. Set to `false` to build the tables with no counters at all. `createTable()` drops them by itself on a kernel that refuses them, giving up as little as possible, so this only skips those attempts. |
+ 
+ ### Methods
+ 
+diff --git a/lib/index.d.ts b/lib/index.d.ts
+index 8515f28..ae12b43 100644
+--- a/lib/index.d.ts
++++ b/lib/index.d.ts
+@@ -71,6 +71,25 @@ export interface NftManagerOptions {
+      * `createTable()` for it to take effect.
+      */
+     acceptReplyTraffic?: boolean;
++    /**
++     * Emit traffic counters. Default: `true`.
++     *
++     * When `false` the tables carry no counters at all: no named counter
++     * objects, no `counter name` references in the rules, no standalone
++     * "processed" rule, and no per-element counter on the sets. Filtering is
++     * unaffected — only the accounting goes away.
++     *
++     * Counters are this module's two newest kernel requirements: stateful
++     * counter objects and set element expressions (`NFT_SET_EXPR`, Linux
++     * >= 5.7). `createTable()` already gives them up by itself when the kernel
++     * refuses them, and gives up as little as possible — a kernel that only
++     * lacks `NFT_SET_EXPR` keeps its named counters. Setting this to `false`
++     * only skips those attempts.
++     *
++     * Applied at table creation time: construct with the desired value and call
++     * `createTable()` for it to take effect.
++     */
++    counters?: boolean;
+ }
+ 
+ /** Options for adding a single address. */
+diff --git a/src/netlink/nft_config.h b/src/netlink/nft_config.h
+index 3cd05d7..87d0e6b 100644
+--- a/src/netlink/nft_config.h
++++ b/src/netlink/nft_config.h
+@@ -27,17 +27,25 @@ struct NftConfig {
+     // stay subject to the sets in both directions. Does not affect the output
+     // chain.
+     bool accept_reply_traffic = true;
++    // Emit traffic counters. When false the tables carry no counters at all:
++    // no named counter objects, no objref expressions in rules, no "processed"
++    // rule, and no per-element counter on the sets. Filtering is unaffected;
++    // only the accounting goes away, along with this module's two newest
++    // kernel requirements.
++    bool counters = true;
+ 
+     static NftConfig from_names(const std::string& table_name,
+                                 const std::vector<std::string>& in_sets,
+                                 const std::vector<std::string>& out_sets,
+                                 const std::vector<std::string>& out_port_sets,
+                                 bool logging = true,
+-                                bool accept_reply_traffic = true) {
++                                bool accept_reply_traffic = true,
++                                bool counters = true) {
+         NftConfig cfg;
+         cfg.table_v4 = table_name;
+         cfg.table_v6 = table_name + "6";
+         cfg.accept_reply_traffic = accept_reply_traffic;
++        cfg.counters = counters;
+         cfg.sets.reserve(in_sets.size() + out_sets.size() + out_port_sets.size());
+         for (const auto& n : in_sets) {
+             cfg.sets.push_back({n, n + "6", logging ? n + ": " : std::string(), SetKind::InIP});
+diff --git a/src/netlink/nl_result.h b/src/netlink/nl_result.h
+index 8eb0d95..c0e93cd 100644
+--- a/src/netlink/nl_result.h
++++ b/src/netlink/nl_result.h
+@@ -5,4 +5,8 @@
+ struct [[nodiscard]] NlResult {
+     bool success;
+     std::string error;
++    // errno reported by the kernel for the first rejected message in the batch,
++    // 0 when there was none. Lets a caller react to a specific refusal instead
++    // of only to "it failed".
++    int error_code = 0;
+ };
+diff --git a/src/netlink/nl_socket.cpp b/src/netlink/nl_socket.cpp
+index 087a24b..50fa798 100644
+--- a/src/netlink/nl_socket.cpp
++++ b/src/netlink/nl_socket.cpp
+@@ -10,6 +10,8 @@ extern "C" {
+ #include <sys/socket.h>
+ 
+ static constexpr size_t RECV_BUF_SIZE = 16384;
++// How long to wait for the kernel's first answer to a batch.
++static constexpr long FIRST_ACK_TIMEOUT_SEC = 2;
+ 
+ // Custom NLMSG_ERROR handler for mnl_cb_run2.
+ // Returns MNL_CB_OK for success ACKs and ignored ENOENT errors,
+@@ -39,8 +41,15 @@ static int batch_error_cb(const struct nlmsghdr* nlh, void* data) {
+     if (ctx->ignore_enoent && err->error == -ENOENT)
+         return MNL_CB_OK; // ignored error — continue
+ 
+-    ctx->has_error = true;
+-    ctx->error_code = -err->error;
++    // Keep the first error, not the last. A batch is a single atomic
++    // transaction: once a set is rejected, every rule that looks it up is
++    // rejected too, with ENOENT. Overwriting hands the caller the cascading
++    // consequence instead of the cause, which hides the real problem and makes
++    // reacting to a specific errno impossible.
++    if (!ctx->has_error) {
++        ctx->has_error = true;
++        ctx->error_code = -err->error;
++    }
+     errno = -err->error;
+     return MNL_CB_ERROR;
+ }
+@@ -91,31 +100,48 @@ NlResult NlSocket::send_batch(struct mnl_nlmsg_batch* batch, bool ignore_enoent)
+     int fd = mnl_socket_get_fd(nl_);
+     char recv_buf[RECV_BUF_SIZE];
+ 
+-    // Match nft CLI pattern: select() with zero timeout to check for data,
+-    // then recv+process in a loop. Continue on errors to collect all ACKs.
++    // Wait for the first response, then drain the rest without blocking.
++    // A zero-timeout poll on the first iteration races the kernel: select()
++    // can report "nothing readable" before the ACKs have been posted, the loop
++    // breaks with has_error still false, and a batch the kernel rejected is
++    // reported as success.
+     fd_set readfds;
+     struct timeval tv;
++    bool got_response = false;
+ 
+     for (;;) {
+         FD_ZERO(&readfds);
+         FD_SET(fd, &readfds);
+-        tv = {0, 0};
++        if (got_response)
++            tv = {0, 0};
++        else
++            tv = {FIRST_ACK_TIMEOUT_SEC, 0};
+ 
+         int sel = select(fd + 1, &readfds, nullptr, nullptr, &tv);
+-        if (sel <= 0)
++        // A signal can interrupt select() before any response arrives; that is
++        // not a batch failure.
++        if (sel < 0 && errno == EINTR)
++            continue;
++        if (sel < 0)
++            return {false, std::string("select: ") + strerror(errno)};
++        if (sel == 0) {
++            if (!got_response)
++                return {false, "timed out waiting for netlink ACK"};
+             break;
++        }
+ 
+         ssize_t ret = mnl_socket_recvfrom(nl_, recv_buf, sizeof(recv_buf));
+         if (ret < 0)
+             return {false, std::string("mnl_socket_recvfrom: ") + strerror(errno)};
+ 
++        got_response = true;
+         mnl_cb_run2(recv_buf, static_cast<size_t>(ret), 0, portid_,
+                      nullptr, &ctx, cb_ctl, NLMSG_ERROR + 1);
+         // Continue on error — collect all acknowledgments
+     }
+ 
+     if (ctx.has_error)
+-        return {false, std::string("batch error: ") + strerror(ctx.error_code)};
++        return {false, std::string("batch error: ") + strerror(ctx.error_code), ctx.error_code};
+ 
+     return {true, ""};
+ }
+diff --git a/src/netlink/table_ops.cpp b/src/netlink/table_ops.cpp
+index 70cf195..8326709 100644
+--- a/src/netlink/table_ops.cpp
++++ b/src/netlink/table_ops.cpp
+@@ -17,6 +17,10 @@ extern "C" {
+ #include <linux/netfilter/nf_conntrack_tuple_common.h>
+ }
+ 
++#include <cerrno>
++#include <cstdio>
++#include <iterator>
++
+ using namespace nft;
+ 
+ // ── Table helpers ────────────────────────────────────────────────────────────
+@@ -72,7 +76,9 @@ static bool add_set(NlBatch& batch, uint32_t family, const char* table,
+                     const char* name, uint32_t key_type, uint32_t key_len,
+                     uint32_t set_id, bool interval = false,
+                     const uint8_t* concat_field_lens = nullptr,
+-                    size_t concat_field_count = 0) {
++                    size_t concat_field_count = 0,
++                    bool with_element_counter = true,
++                    bool use_concat_flag = true) {
+     auto s = nft::make_set();
+     if (!s) return false;
+     nftnl_set_set_str(s.get(), NFTNL_SET_TABLE, table);
+@@ -81,10 +87,12 @@ static bool add_set(NlBatch& batch, uint32_t family, const char* table,
+     nftnl_set_set_u32(s.get(), NFTNL_SET_KEY_TYPE, key_type);
+     nftnl_set_set_u32(s.get(), NFTNL_SET_KEY_LEN, key_len);
+ 
+-    uint32_t set_flags = NFT_SET_TIMEOUT | NFT_SET_EXPR;
++    uint32_t set_flags = NFT_SET_TIMEOUT;
++    if (with_element_counter)
++        set_flags |= NFT_SET_EXPR;
+     if (interval)
+         set_flags |= NFT_SET_INTERVAL;
+-    if (concat_field_lens && concat_field_count > 0)
++    if (concat_field_lens && concat_field_count > 0 && use_concat_flag)
+         set_flags |= NFT_SET_CONCAT;
+     nftnl_set_set_u32(s.get(), NFTNL_SET_FLAGS, set_flags);
+     nftnl_set_set_u32(s.get(), NFTNL_SET_ID, set_id);
+@@ -94,10 +102,12 @@ static bool add_set(NlBatch& batch, uint32_t family, const char* table,
+                            concat_field_lens, concat_field_count);
+     }
+ 
+-    // Per-element counter expression
+-    struct nftnl_expr* counter = nftnl_expr_alloc("counter");
+-    if (!counter) return false;
+-    nftnl_set_add_expr(s.get(), counter);  // ownership transferred
++    if (with_element_counter) {
++        // Per-element counter expression
++        struct nftnl_expr* counter = nftnl_expr_alloc("counter");
++        if (!counter) return false;
++        nftnl_set_add_expr(s.get(), counter);  // ownership transferred
++    }
+ 
+     struct nlmsghdr* nlh = batch.add_msg(NFT_MSG_NEWSET, family, NLM_F_CREATE | NLM_F_ACK);
+     if (!nlh) return false;
+@@ -258,7 +268,7 @@ static bool add_rule_in_ip(NlBatch& batch, uint32_t family, const char* table,
+         return add_expr_payload(r, NFT_PAYLOAD_NETWORK_HEADER, NFT_REG_1, payload_offset, addr_len)
+             && add_expr_lookup(r, set_name, NFT_REG_1)
+             && (!log_prefix || *log_prefix == '\0' || add_expr_log(r, log_prefix))
+-            && add_expr_counter_ref(r, counter_name)
++            && (!counter_name || *counter_name == '\0' || add_expr_counter_ref(r, counter_name))
+             && add_expr_drop(r);
+     });
+ }
+@@ -271,7 +281,7 @@ static bool add_rule_out_ip(NlBatch& batch, uint32_t family, const char* table,
+     return add_rule_with(batch, family, table, chain, [&](nftnl_rule* r) {
+         return add_expr_payload(r, NFT_PAYLOAD_NETWORK_HEADER, NFT_REG_1, payload_offset, addr_len)
+             && add_expr_lookup(r, set_name, NFT_REG_1)
+-            && add_expr_counter_ref(r, counter_name)
++            && (!counter_name || *counter_name == '\0' || add_expr_counter_ref(r, counter_name))
+             && add_expr_drop(r);
+     });
+ }
+@@ -300,7 +310,7 @@ static bool add_rule_out_port_concat(NlBatch& batch, uint32_t family, const char
+ 
+         // lookup in concatenated set starting from REG32_00
+         return add_expr_lookup(r, set_name, NFT_REG32_00)
+-            && add_expr_counter_ref(r, counter_name)
++            && (!counter_name || *counter_name == '\0' || add_expr_counter_ref(r, counter_name))
+             && add_expr_drop(r);
+     });
+ }
+@@ -310,7 +320,10 @@ static bool add_rule_out_port_concat(NlBatch& batch, uint32_t family, const char
+ CreateTableOp::CreateTableOp(std::shared_ptr<const nft::NftConfig> config)
+     : cfg_(std::move(config)) {}
+ 
+-NlResult CreateTableOp::execute(NlSocket& sock) {
++NlResult CreateTableOp::create_once(NlSocket& sock, bool use_concat_flag,
++                                    CounterMode counter_mode) {
++    // Empty counter name => the rule carries no objref expression.
++    const bool any_counter = counter_mode != CounterMode::None;
+     // Phase 1: Delete existing tables (idempotent)
+     {
+         NlBatch batch;
+@@ -335,16 +348,18 @@ NlResult CreateTableOp::execute(NlSocket& sock) {
+         || !add_table(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), NFT_MSG_NEWTABLE, NLM_F_CREATE))
+         return {false, "failed to build tables"};
+ 
+-    // Named counter: "processed" (global traffic counter)
+-    if (!add_counter_obj(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), COUNTER_NAME)
+-        || !add_counter_obj(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), COUNTER_NAME))
+-        return {false, "failed to build 'processed' counter"};
+-
+-    // Named counters: per-set
+-    for (const auto& sd : cfg_->sets) {
+-        if (!add_counter_obj(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), sd.name.c_str())
+-            || !add_counter_obj(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), sd.name_v6.c_str()))
+-            return {false, "failed to build counter for set '" + sd.name + "'"};
++    if (any_counter) {
++        // Named counter: "processed" (global traffic counter)
++        if (!add_counter_obj(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), COUNTER_NAME)
++            || !add_counter_obj(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), COUNTER_NAME))
++            return {false, "failed to build 'processed' counter"};
++
++        // Named counters: per-set
++        for (const auto& sd : cfg_->sets) {
++            if (!add_counter_obj(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), sd.name.c_str())
++                || !add_counter_obj(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), sd.name_v6.c_str()))
++                return {false, "failed to build counter for set '" + sd.name + "'"};
++        }
+     }
+ 
+     // Sets
+@@ -369,9 +384,11 @@ NlResult CreateTableOp::execute(NlSocket& sock) {
+         }
+         bool is_interval = (sd.kind != SetKind::OutPort);
+         if (!add_set(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), sd.name.c_str(),
+-                     key_type_v4, key_len_v4, sid++, is_interval, concat_fields, concat_count)
++                     key_type_v4, key_len_v4, sid++, is_interval, concat_fields, concat_count,
++                     counter_mode == CounterMode::Full, use_concat_flag)
+             || !add_set(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), sd.name_v6.c_str(),
+-                        key_type_v6, key_len_v6, sid++, is_interval, concat_fields, concat_count))
++                        key_type_v6, key_len_v6, sid++, is_interval, concat_fields, concat_count,
++                        counter_mode == CounterMode::Full, use_concat_flag))
+             return {false, "failed to build set '" + sd.name + "'"};
+     }
+ 
+@@ -384,12 +401,16 @@ NlResult CreateTableOp::execute(NlSocket& sock) {
+         || !add_chain(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), CHAIN_OUTPUT, NF_INET_LOCAL_OUT))
+         return {false, "failed to build chains"};
+ 
+-    // Rules: "counter name processed" on input + forward chains
+-    if (!add_rule_counter_ref(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), CHAIN_INPUT)
+-        || !add_rule_counter_ref(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), CHAIN_FORWARD)
+-        || !add_rule_counter_ref(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), CHAIN_INPUT)
+-        || !add_rule_counter_ref(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), CHAIN_FORWARD))
+-        return {false, "failed to build 'processed' counter rules"};
++    // Rules: "counter name processed" on input + forward chains.
++    // The objref is this rule's only expression, so without counters the rule
++    // is skipped rather than emitted empty.
++    if (any_counter) {
++        if (!add_rule_counter_ref(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), CHAIN_INPUT)
++            || !add_rule_counter_ref(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), CHAIN_FORWARD)
++            || !add_rule_counter_ref(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), CHAIN_INPUT)
++            || !add_rule_counter_ref(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), CHAIN_FORWARD))
++            return {false, "failed to build 'processed' counter rules"};
++    }
+ 
+     // Rules: "ct direction reply accept" on input + forward chains.
+     // Must be appended after the counter rules and before the per-set rules so
+@@ -405,17 +426,19 @@ NlResult CreateTableOp::execute(NlSocket& sock) {
+     // Rules per set
+     for (const auto& sd : cfg_->sets) {
+         const char* lp = sd.log_prefix.c_str();
++        const char* cn_v4 = any_counter ? sd.name.c_str() : "";
++        const char* cn_v6 = any_counter ? sd.name_v6.c_str() : "";
+         switch (sd.kind) {
+         case SetKind::InIP:
+             // input + forward: saddr + log + counter_ref + drop
+             if (!add_rule_in_ip(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), CHAIN_INPUT,
+-                                sd.name.c_str(), IPV4_SRC_OFFSET, IPV4_ADDR_LEN, lp, sd.name.c_str())
++                                sd.name.c_str(), IPV4_SRC_OFFSET, IPV4_ADDR_LEN, lp, cn_v4)
+                 || !add_rule_in_ip(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), CHAIN_FORWARD,
+-                                   sd.name.c_str(), IPV4_SRC_OFFSET, IPV4_ADDR_LEN, lp, sd.name.c_str())
++                                   sd.name.c_str(), IPV4_SRC_OFFSET, IPV4_ADDR_LEN, lp, cn_v4)
+                 || !add_rule_in_ip(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), CHAIN_INPUT,
+-                                   sd.name_v6.c_str(), IPV6_SRC_OFFSET, IPV6_ADDR_LEN, lp, sd.name_v6.c_str())
++                                   sd.name_v6.c_str(), IPV6_SRC_OFFSET, IPV6_ADDR_LEN, lp, cn_v6)
+                 || !add_rule_in_ip(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), CHAIN_FORWARD,
+-                                   sd.name_v6.c_str(), IPV6_SRC_OFFSET, IPV6_ADDR_LEN, lp, sd.name_v6.c_str()))
++                                   sd.name_v6.c_str(), IPV6_SRC_OFFSET, IPV6_ADDR_LEN, lp, cn_v6))
+                 return {false, "failed to build rules for set '" + sd.name + "'"};
+             break;
+ 
+@@ -423,19 +446,19 @@ NlResult CreateTableOp::execute(NlSocket& sock) {
+             // output: daddr + counter_ref + drop (NO log)
+             if (!add_rule_out_ip(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), CHAIN_OUTPUT,
+                                  sd.name.c_str(), IPV4_DST_OFFSET, IPV4_ADDR_LEN,
+-                                 sd.name.c_str())
++                                 cn_v4)
+                 || !add_rule_out_ip(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), CHAIN_OUTPUT,
+                                     sd.name_v6.c_str(), IPV6_DST_OFFSET, IPV6_ADDR_LEN,
+-                                    sd.name_v6.c_str()))
++                                    cn_v6))
+                 return {false, "failed to build output rules for set '" + sd.name + "'"};
+             break;
+ 
+         case SetKind::OutPort:
+             // output: single concatenated (proto . port) lookup + counter_ref + drop
+             if (!add_rule_out_port_concat(batch, NFPROTO_IPV4, cfg_->table_v4.c_str(), CHAIN_OUTPUT,
+-                                          sd.name.c_str(), sd.name.c_str())
++                                          sd.name.c_str(), cn_v4)
+                 || !add_rule_out_port_concat(batch, NFPROTO_IPV6, cfg_->table_v6.c_str(), CHAIN_OUTPUT,
+-                                             sd.name_v6.c_str(), sd.name_v6.c_str()))
++                                             sd.name_v6.c_str(), cn_v6))
+                 return {false, "failed to build port rules for set '" + sd.name + "'"};
+             break;
+         }
+@@ -444,6 +467,73 @@ NlResult CreateTableOp::execute(NlSocket& sock) {
+     return batch.execute(sock);
+ }
+ 
++
++// Two of the things createTable() asks for are newer than the rest and are not
++// available on every kernel that otherwise speaks nftables:
++//
++//   NFT_SET_EXPR    the per-element counter on every set, Linux >= 5.7
++//   NFT_SET_CONCAT  the flag announcing the concatenated key of a port set
++//
++// Both are optional and both are refused with EINVAL. A concatenated set is
++// still described by NFTA_SET_DESC_CONCAT, which such kernels do understand, so
++// only the flag has to go; and dropping the per-element expression leaves the
++// named counter objects — which are old and widely supported — still accounting
++// blocked traffic per set.
++//
++// The ladder therefore gives up as little as possible at each step, and only
++// after the kernel has refused the step before. A kernel that lacks nothing but
++// NFT_SET_EXPR keeps its per-set numbers and loses only the per-element
++// breakdown; giving up counters entirely is the last resort. `counters: false`
++// starts at that end, as asked.
++//
++// On a kernel that supports both features the first attempt succeeds and
++// nothing else runs.
++NlResult CreateTableOp::execute(NlSocket& sock) {
++    struct Attempt {
++        bool concat_flag;
++        CounterMode counters;
++        const char* given_up;  // nullptr for the attempt that gives up nothing
++    };
++
++    static constexpr Attempt full[] = {
++        {true, CounterMode::Full, nullptr},
++        {false, CounterMode::Full, "the NFT_SET_CONCAT flag"},
++        {true, CounterMode::NamedOnly, "per-element counters"},
++        {false, CounterMode::NamedOnly, "per-element counters and the NFT_SET_CONCAT flag"},
++        {true, CounterMode::None, "all counters"},
++        {false, CounterMode::None, "all counters and the NFT_SET_CONCAT flag"},
++    };
++    // A caller that asked for no counters has nothing to give up on that axis.
++    static constexpr Attempt without_counters[] = {
++        {true, CounterMode::None, nullptr},
++        {false, CounterMode::None, "the NFT_SET_CONCAT flag"},
++    };
++
++    const Attempt* attempts = cfg_->counters ? full : without_counters;
++    const size_t count = cfg_->counters ? std::size(full) : std::size(without_counters);
++
++    NlResult first{false, "no attempt made", 0};
++    for (size_t i = 0; i < count; ++i) {
++        NlResult res = create_once(sock, attempts[i].concat_flag, attempts[i].counters);
++        if (res.success) {
++            if (attempts[i].given_up) {
++                // A silent downgrade would leave someone hunting for counters
++                // that are never going to appear, so say it once.
++                std::fprintf(stderr,
++                             "nftables-napi: this kernel refused part of the table; "
++                             "created it without %s\n",
++                             attempts[i].given_up);
++            }
++            return res;
++        }
++        if (i == 0) first = res;
++        // Only EINVAL means "this kernel does not know that". Anything else is
++        // a real failure, and retrying with fewer features would just hide it.
++        if (res.error_code != EINVAL) break;
++    }
++    return first;
++}
++
+ // ── DeleteTableOp ───────────────────────────────────────────────────────────
+ 
+ DeleteTableOp::DeleteTableOp(std::shared_ptr<const nft::NftConfig> config)
+diff --git a/src/netlink/table_ops.h b/src/netlink/table_ops.h
+index d28d514..184456a 100644
+--- a/src/netlink/table_ops.h
++++ b/src/netlink/table_ops.h
+@@ -4,12 +4,27 @@
+ #include "nft_config.h"
+ #include <memory>
+ 
++// How much of the counter machinery one createTable() attempt asks for. The
++// public `counters` option is a boolean; this is the finer grain the fallback
++// needs, because the two mechanisms have different kernel requirements:
++// stateful counter objects are old, per-element set expressions (NFT_SET_EXPR)
++// are not.
++enum class CounterMode {
++    Full,       // named counter objects, objref in rules, per-element expression
++    NamedOnly,  // as above without the per-element expression
++    None,       // no counter of any kind
++};
++
+ class CreateTableOp final : public NlOperation {
+ public:
+     explicit CreateTableOp(std::shared_ptr<const nft::NftConfig> config);
+     NlResult execute(NlSocket& sock) override;
+ 
+ private:
++    // One full attempt. The arguments select the optional features some kernels
++    // reject; execute() retries giving up as little as possible.
++    NlResult create_once(NlSocket& sock, bool use_concat_flag, CounterMode counter_mode);
++
+     std::shared_ptr<const nft::NftConfig> cfg_;
+ };
+ 
+diff --git a/src/nft_manager.cpp b/src/nft_manager.cpp
+index fb9ce26..c4ca425 100644
+--- a/src/nft_manager.cpp
++++ b/src/nft_manager.cpp
+@@ -352,11 +352,18 @@ NftManager::NftManager(const Napi::CallbackInfo& info)
+         parse_optional_bool(env, opts, "acceptReplyTraffic", "NftManager", true);
+     if (env.IsExceptionPending()) return;
+ 
++    // counters — emit traffic counters. Turning them off drops this module's
++    // two newest kernel requirements; createTable() gets there on its own when
++    // the kernel refuses them, so this only skips the round trips.
++    bool counters = parse_optional_bool(env, opts, "counters", "NftManager", true);
++    if (env.IsExceptionPending()) return;
++
+     std::string table_name = opts.Get("tableName").As<Napi::String>().Utf8Value();
+ 
+     config_ = std::make_shared<const nft::NftConfig>(
+         nft::NftConfig::from_names(table_name, in_sets, out_sets, out_port_sets,
+-                                   logging, accept_reply_traffic));
++                                   logging, accept_reply_traffic,
++                                   counters));
+ 
+     sock_ = std::make_shared<NlSocket>();
+ 
+diff --git a/test/test.mjs b/test/test.mjs
+index 61d35e4..1707117 100644
+--- a/test/test.mjs
++++ b/test/test.mjs
+@@ -188,6 +188,21 @@ describe('NftManager constructor validation', () => {
+         const mgr = new NftManager({ tableName: 'test', ingressAddrSets: ['bl'], acceptReplyTraffic: undefined });
+         assert.ok(mgr);
+     });
++
++    // counters validation
++    it('should throw with non-boolean counters', { skip: !canCreateContext }, () => {
++        assert.throws(() => new NftManager({ tableName: 't', ingressAddrSets: ['bl'], counters: 'false' }), { name: 'TypeError' });
++    });
++
++    it('should accept counters: false', { skip: !canCreateContext }, () => {
++        const mgr = new NftManager({ tableName: 'test', ingressAddrSets: ['bl'], counters: false });
++        assert.ok(mgr);
++    });
++
++    it('should accept counters: undefined (defaults to true)', { skip: !canCreateContext }, () => {
++        const mgr = new NftManager({ tableName: 'test', ingressAddrSets: ['bl'], counters: undefined });
++        assert.ok(mgr);
++    });
+ });
+ 
+ // ─── Method validation ──────────────────────────────────────────────────────

@@ -52,7 +52,11 @@ jobs:
             UPSTREAM_DOCKERFILE_PATH=Dockerfile
           fi
           XRAY=$(printf '%s\n' "$UPSTREAM_DOCKERFILE" | sed -n 's/^ARG XRAY_CORE_VERSION=//p')
-          NFTABLES_NAPI=$(git ls-remote https://github.com/Medium1992/nftables-napi-fork.git refs/heads/routeros-native-netlink | cut -f1)
+          NFTABLES_NAPI=$(cat NFTABLES_NAPI_VERSION)
+          if [ ! -f "patches/routeros-${NFTABLES_NAPI}.patch" ]; then
+            echo "no patch for nftables-napi ${NFTABLES_NAPI}"
+            exit 1
+          fi
 
           for variable in REMNANODE XRAY NFTABLES_NAPI UPSTREAM_DOCKERFILE_PATH; do
             test -n "${!variable}" && test "${!variable}" != "null" || { echo "$variable is empty"; exit 1; }
@@ -104,13 +108,13 @@ jobs:
             image=moby/buildkit:master
             network=host
 
-      - name: Restore nftables-napi package cache
+      - name: Restore nftables-napi prebuild cache
         if: steps.check_versions.outputs.build_needed == 'true'
         id: napi-cache
         uses: actions/cache/restore@v4
         with:
-          path: nftables-napi-cache/nftables-napi-routeros.tgz
-          key: nftables-napi-routeros-${{ env.nftables_napi }}
+          path: nftprebuilds
+          key: nftables-napi-routeros-${{ env.nftables_napi }}-${{ hashFiles('patches/*.patch', 'Dockerfile.nftables-napi') }}
 
       - name: Prepare upstream Node build context
         if: steps.check_versions.outputs.build_needed == 'true'
@@ -119,55 +123,36 @@ jobs:
 
           git clone --depth 1 --branch "${{ env.remnanode }}" https://github.com/remnawave/node.git upstream
 
-          mkdir -p nftables-napi-cache
+          # Fail in seconds rather than after a full image build when upstream
+          # moves to a release the patch has not been rebuilt against.
+          UPSTREAM_NAPI=$(node -p "require('./upstream/package.json').dependencies['nftables-napi']")
+          if [ "$UPSTREAM_NAPI" != "${{ env.nftables_napi }}" ]; then
+            echo "node ${{ env.remnanode }} pins nftables-napi $UPSTREAM_NAPI, the RouterOS patch is for ${{ env.nftables_napi }}"
+            echo "Rebuild the patch against $UPSTREAM_NAPI and update NFTABLES_NAPI_VERSION."
+            exit 1
+          fi
+
+          # One amd64 build cross-compiles both architectures with zig.
           if [ "${{ steps.napi-cache.outputs.cache-hit }}" != "true" ]; then
             docker buildx build \
               --platform linux/amd64 \
-              --build-arg NFTABLES_NAPI_REF="${{ env.nftables_napi }}" \
-              --output type=local,dest=nftables-napi-amd64 \
+              --build-arg NFTABLES_NAPI_VERSION="${{ env.nftables_napi }}" \
+              --output type=local,dest=nftprebuilds \
               -f Dockerfile.nftables-napi \
               .
-            docker buildx build \
-              --platform linux/arm64 \
-              --build-arg NFTABLES_NAPI_REF="${{ env.nftables_napi }}" \
-              --output type=local,dest=nftables-napi-arm64 \
-              -f Dockerfile.nftables-napi \
-              .
-
-            git clone https://github.com/Medium1992/nftables-napi-fork.git nftables-napi-package
-            pushd nftables-napi-package
-            git checkout "${{ env.nftables_napi }}"
-            mkdir -p prebuilds/linux-x64 prebuilds/linux-arm64
-            cp ../nftables-napi-amd64/prebuilds/linux-x64/nftables-napi.glibc.node prebuilds/linux-x64/
-            cp ../nftables-napi-arm64/prebuilds/linux-arm64/nftables-napi.glibc.node prebuilds/linux-arm64/
-            npm pack --pack-destination ../nftables-napi-cache
-            popd
-            mv nftables-napi-cache/nftables-napi-*.tgz nftables-napi-cache/nftables-napi-routeros.tgz
           fi
 
-          mkdir -p upstream/vendor
-          cp nftables-napi-cache/nftables-napi-routeros.tgz upstream/vendor/
+          test -s "nftprebuilds/linux-x64/nftables-napi.glibc.node"
+          test -s "nftprebuilds/linux-arm64/nftables-napi.glibc.node"
 
-          pushd upstream
-          npm pkg set 'dependencies.nftables-napi=file:vendor/nftables-napi-routeros.tgz'
-          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
-          python3 - <<'PY'
-          from pathlib import Path
+          cp -r nftprebuilds upstream/nftprebuilds
+          python3 scripts/patch-dockerfile.py "upstream/${{ env.upstream_dockerfile }}"
 
-          path = Path("${{ env.upstream_dockerfile }}")
-          text = path.read_text()
-          needle = "COPY package*.json ./\n"
-          if text.count(needle) != 1:
-              raise SystemExit(f"Expected exactly one package.json COPY instruction in {path}")
-          path.write_text(text.replace(needle, needle + "COPY vendor/ ./vendor/\n"))
-          PY
-          popd
-
-      - name: Save nftables-napi package cache
+      - name: Save nftables-napi prebuild cache
         if: steps.check_versions.outputs.build_needed == 'true' && steps.napi-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: nftables-napi-cache/nftables-napi-routeros.tgz
+          path: nftprebuilds
           key: ${{ steps.napi-cache.outputs.cache-primary-key }}
 
       - name: Login to GitHub Container Registry
